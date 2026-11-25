@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  html,body{margin:0;height:100%;background:#050308;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #g{filter:blur(6px) brightness(1.25) saturate(1.3);mix-blend-mode:screen;opacity:.7;image-rendering:auto}
+  #hint{position:fixed;left:0;right:0;bottom:8px;text-align:center;font:11px ui-monospace,Menlo,Consolas,monospace;
+        color:#ffffff30;letter-spacing:.08em;pointer-events:none;user-select:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="g"></canvas>
+<div id="hint">click: replay &nbsp;·&nbsp; space: pause</div>
+<script>
+(() => {
+"use strict";
+const D = __DATA__;
+const TAU = Math.PI * 2, HP = Math.PI / 2;
+
+/* ---- timeline (seconds) ---- */
+const T_LOOP = 26;
+const OPEN0 = 6.5, OSPAN = 3.6, ODUR = 3.2;     // petals unfurl
+const TEXT0 = 12.2, TSPAN = 3.8;                 // letters assemble
+const DISS0 = 22.0;                              // dissolve back to noise
+
+/* ---- helpers ---- */
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const sm = v => { v = clamp(v); return v * v * (3 - 2 * v); };
+const lerp = (a, b, t) => a + (b - a) * t;
+function rng(seed){return()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);
+  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const R0 = rng(1234);
+const gauss = () => (R0()+R0()+R0()-1.5) / 0.75;
+const RAMP = " .:-=+*#%@";
+const GL = "░▒▓█▀▄▌▐<>/\\|{}[]01#$%&*+=~^;:?!".split("");
+const FONT = "ui-monospace, 'DejaVu Sans Mono', Menlo, Consolas, monospace";
+
+/* ---- colour gradient for the rose (dark magenta -> pink -> blush) ---- */
+const STOPS = [[0,[40,2,24]],[.28,[150,12,70]],[.55,[232,52,128]],[.8,[255,150,190]],[1,[255,232,240]]];
+const LUT = new Uint8Array(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const f = i / 255; let k = 0;
+  while (k < STOPS.length - 2 && f > STOPS[k + 1][0]) k++;
+  const [fa, ca] = STOPS[k], [fb, cb] = STOPS[k + 1], u = clamp((f - fa) / (fb - fa));
+  for (let j = 0; j < 3; j++) LUT[i * 3 + j] = lerp(ca[j], cb[j], u);
+}
+const ART = [[70,215,225],[140,105,255],[110,130,150],[255,80,150],[190,200,220]];
+
+/* ---- rose particles ---- */
+const N = D.x.length;
+const px_ = Float32Array.from(D.x), pth = Float32Array.from(D.th), pR = Float32Array.from(D.R);
+const pA = new Float32Array(N), pphi = new Float32Array(N), psth = new Float32Array(N);
+const pshard = new Uint16Array(N), plx = new Float32Array(N), ply = new Float32Array(N);
+const pta = new Float32Array(N), ptd = new Float32Array(N), ptv = new Float32Array(N);
+const prn = new Float32Array(N), pac = new Uint8Array(N), pv = new Float32Array(N);
+const NSH = 56;
+const shards = Array.from({length: NSH}, () => ({
+  ang: R0() * TAU, rad: .35 + R0() * .75, w: 2 + R0() * 13, h: 1 + R0() * 4,
+  spin: (R0() - .5) * .5, arr: R0(), jx: 0, jy: 0, col: Math.floor(R0() * ART.length),
+  stripe: R0() < .5
+}));
+for (let i = 0; i < N; i++) {
+  const x = px_[i];
+  pA[i] = 1.95653 * x * x * (1.27689 * x - 1) * (1.27689 * x - 1);
+  pphi[i] = HP * Math.exp(-pth[i] / (8 * Math.PI));
+  psth[i] = clamp((pth[i] + 2 * Math.PI) / (17 * Math.PI));      // 0 = outer, 1 = centre
+  const s = pshard[i] = Math.floor(R0() * NSH);
+  plx[i] = (R0() - .5); ply[i] = (R0() - .5);
+  pta[i] = 2.2 + 3.2 * shards[s].arr + R0() * .9;
+  ptd[i] = DISS0 + R0() * 1.6;
+  ptv[i] = R0() * 2.2;
+  prn[i] = R0(); pv[i] = R0();
+  pac[i] = R0() < .8 ? shards[s].col : Math.floor(R0() * ART.length);
+}
+
+/* ---- layout / text particles ---- */
+let W, H, dpr, cols, rows, cw, chh, fs, S, cx0, cy0, tm, tTop, tLeft;
+let tp = [];            // text particles
+const cvs = document.getElementById("c"), ctx = cvs.getContext("2d");
+const glow = document.getElementById("g"), gctx = glow.getContext("2d");
+let cCh, cR, cG, cB, cZ;
+
+function layout() {
+  W = innerWidth; H = innerHeight; dpr = Math.min(devicePixelRatio || 1, 2);
+  cvs.width = W * dpr; cvs.height = H * dpr;
+  glow.width = Math.ceil(W / 5); glow.height = Math.ceil(H / 5);
+  cols = clamp(Math.round(W / 8), 40, 200);
+  tm = (D.single.w + 6 <= cols) ? D.single : D.double;
+  cols = Math.max(cols, tm.w + 4);                 // always fit the message
+  cw = W / cols; fs = cw / 0.6; rows = Math.floor(H / (fs * 1.18)); chh = H / rows;
+  const bottomMargin = Math.max(2, Math.round(rows * .06));
+  tTop = rows - tm.h - bottomMargin; tLeft = Math.floor((cols - tm.w) / 2);
+  const avail = tTop * chh;
+  S = Math.min(avail * .46, W * .3); cx0 = W / 2; cy0 = avail * .5;
+  const n = cCh ? 0 : 0;
+  cCh = new Uint8Array(cols * rows); cR = new Uint8Array(cols * rows);
+  cG = new Uint8Array(cols * rows); cB = new Uint8Array(cols * rows);
+  cZ = new Float32Array(cols * rows);
+  // text particles
+  const r = rng(99); tp = [];
+  const c = tm.cells;
+  for (let i = 0; i < c.length; i += 3) {
+    const rr = c[i], cc = c[i + 1], v = c[i + 2];
+    tp.push({ r: tTop + rr, c: tLeft + cc, v, cx: cc / tm.w,
+      sr: tTop + (r() - .5) * rows * 1.1 + rows * .25, sc: cols * r(), rn: r(),
+      tr: TEXT0 + TSPAN * (cc / tm.w) + r() * .55, td: DISS0 + r() * 1.5 });
+  }
+}
+
+/* ---- cell buffer ---- */
+function put(c, r, z, chIdx, R, G, B) {
+  if (c < 0 || r < 0 || c >= cols || r >= rows) return;
+  const k = r * cols + c;
+  if (z <= cZ[k]) return;
+  cZ[k] = z; cCh[k] = chIdx; cR[k] = R > 255 ? 255 : R; cG[k] = G > 255 ? 255 : G; cB[k] = B > 255 ? 255 : B;
+}
+// chIdx: 1..9 -> RAMP char, 10.. -> glitch char (idx-10)
+const glIdx = h => 10 + Math.floor(h * GL.length) % GL.length;
+
+/* ---- scene ---- */
+const EL = 30 * Math.PI / 180, sE = Math.sin(EL), cE = Math.cos(EL);
+let ambCells = [], ambAt = -1;
+const E0 = new Float64Array(3), E1 = new Float64Array(3), E2 = new Float64Array(3);
+const LL = Math.hypot(-.55, -.55, .65), LX = -.55 / LL, LY = -.55 / LL, LZ = .65 / LL;
+// parametric rose surface (Nylander), petals unfurl with o: 0 = bud, 1 = open
+function ev(x, th, A, o, spin, zoff, out, modR) {
+  const u = 1 - (((3.6 * th) % TAU + TAU) % TAU) / Math.PI, q = 1.25 * u * u - .25;
+  const R = 1 - .5 * q * q;
+  const phi = HP * Math.exp(-th / (8 * Math.PI)) * (0.16 + 0.84 * o);
+  const sp = Math.sin(phi), cp = Math.cos(phi), y = A * sp;
+  const r = R * (x * sp + y * cp), ang = th + spin;
+  out[0] = r * Math.sin(ang); out[1] = r * Math.cos(ang); out[2] = R * (x * cp - y * sp) + zoff;
+}
+
+function render(t) {
+  cZ.fill(-1e9); cCh.fill(0);
+  const gf = Math.floor(t * 12);
+  const pull = sm(t / 7.5) * (1 - sm((t - DISS0) / 3.2));
+  const fadeAll = 1 - sm((t - (T_LOOP - 1.6)) / 1.4);
+  const spin = 0.55 * t + 0.6 * Math.sin(t * .3);
+  const growth = sm((t - OPEN0 + 1) / (OSPAN + ODUR + 1));
+  const rs = S * (0.55 + 0.5 * growth) * (1 + 0.012 * Math.sin(t * 2));
+  const zoff = lerp(-0.45, -0.02, growth);
+
+  // shard positions
+  for (const s of shards) {
+    const a = s.ang + s.spin * t * (1 - .7 * pull);
+    const rad = lerp(s.rad, 0.02, pull);
+    const q = Math.floor(t * 9);
+    if ((q * 2654435761 + s.arr * 1e6 | 0) % 7 === 0) { s.jx = (R0() - .5) * 6; s.jy = (R0() - .5) * 2; }
+    else if (q % 3 === 0) { s.jx *= .5; s.jy *= .5; }
+    s.px = cx0 + Math.cos(a) * rad * W * .5 + s.jx * cw;
+    s.py = cy0 + Math.sin(a) * rad * H * .42 + s.jy * chh;
+  }
+
+  /* rose / artifact particles */
+  for (let i = 0; i < N; i++) {
+    const vis = sm((t - ptv[i]) / .8) * fadeAll;
+    if (pv[i] > vis) continue;
+    const e0 = sm((t - pta[i]) / 2.4) * (1 - sm((t - ptd[i]) / 2.2));
+    const e = e0 * e0 * (3 - 2 * e0);
+    const s = shards[pshard[i]];
+    // scatter position (inside a glitchy rectangle)
+    let sx = s.px + plx[i] * s.w * cw, sy = s.py + ply[i] * s.h * chh;
+    if (s.stripe && ((Math.floor(sy / chh)) & 1)) { if (e < .5) continue; }
+    // rose position
+    const o = sm((t - OPEN0 - OSPAN * psth[i]) / ODUR);
+    const x = px_[i], R = pR[i];
+    ev(x, pth[i], pA[i], o, spin, zoff, E0);
+    const X1 = E0[0], Y1 = E0[1], Z = E0[2];
+    const up = Y1 * sE + Z * cE, near = -Y1 * cE + Z * sE;
+    // surface normal from two nearby samples -> Lambert lighting
+    let lam = .5;
+    if (e > .25) {
+    const x2 = Math.min(x + .02, 1.02);
+    ev(x2, pth[i], 1.95653 * x2 * x2 * (1.27689 * x2 - 1) * (1.27689 * x2 - 1), o, spin, zoff, E1);
+    ev(x, pth[i] + .035, pA[i], o, spin, zoff, E2, true);
+    const ax = E1[0] - E0[0], ay = E1[1] - E0[1], az = E1[2] - E0[2];
+    const bx = E2[0] - E0[0], by = E2[1] - E0[1], bz = E2[2] - E0[2];
+    let nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+    // face the camera (camera dir C = (0,-cE,sE))
+    if (-ny * cE + nz * sE < 0) { nx = -nx; ny = -ny; nz = -nz; }
+    lam = clamp(nx * LX + ny * LY + nz * LZ);
+    }
+    let rx = cx0 + X1 * rs, ry = cy0 - up * rs + rs * .12;
+    // curved flight path while converging
+    const bow = Math.sin(e * Math.PI) * 70 * (prn[i] - .5);
+    let X = lerp(sx, rx, e) + bow, Y = lerp(sy, ry, e) - bow * .4;
+    const c = Math.floor(X / cw), rr = Math.floor(Y / chh);
+    // shade: lambert + soft base darkening (occlusion) + bright petal rims
+    const rim = sm((x - .88) / .12);
+    let b = .08 + .72 * Math.pow(lam, 1.15) * (.35 + .65 * Math.pow(x, .7)) + .3 * rim * (.5 + lam) + .08 * (pv[i] - .5);
+    b = clamp(b * (.78 + .22 * o) * (.42 + .8 * clamp(.5 + .6 * near)));
+    const li = Math.floor(b * 255) * 3;
+    let cr, cg, cb, ci;
+    const hh = ((i * 7919 + gf * 104729) % 9973) / 9973;
+    if (hh < e * e * 1.05 || e > .96) {                // settled glyph from the ramp
+      ci = 1 + Math.min(8, Math.floor(b * 9.4));
+      cr = LUT[li]; cg = LUT[li + 1]; cb = LUT[li + 2];
+    } else {                                           // glitch glyph
+      ci = glIdx(hh * 7.31 % 1);
+      const ac = ART[pac[i]], m = e;
+      cr = lerp(ac[0] * .75, LUT[li], m); cg = lerp(ac[1] * .75, LUT[li + 1], m); cb = lerp(ac[2] * .75, LUT[li + 2], m);
+    }
+    put(c, rr, e > .5 ? near + 3 : -2 + prn[i], ci, cr, cg, cb);
+  }
+
+  /* message */
+  const wave = t * 2.4;
+  for (const p of tp) {
+    const u0 = sm((t - p.tr + 1.5) / 1.5), ud = 1 - sm((t - p.td) / 2);
+    const u = u0 * ud * fadeAll;
+    if (u <= .02) continue;
+    const e = u0 * u0 * (3 - 2 * u0);
+    const ee = e * (1 - (1 - ud));        // position eases back out on dissolve
+    const cc = lerp(p.sc, p.c, ee * ud + 0 * (1 - ud)) + Math.sin(t * 6 + p.rn * 9) * (1 - e) * 2;
+    const rr = lerp(p.sr, p.r, ee * ud);
+    const settled = e > .97 && ud > .97;
+    const h = ((p.rn * 9973 + gf * 7717) % 997) / 997;
+    let ci, R, G, B;
+    const shimmer = .5 + .5 * Math.sin(p.c * .22 - wave + p.r * .15);
+    const flash = clamp(1 - (t - p.tr) / .7) * (t > p.tr ? 1 : 0);
+    if (settled && h > .035) {
+      const lv = clamp(p.v / 255);
+      ci = 1 + Math.min(8, Math.floor((.35 + .65 * lv) * 9.4 * (.82 + .18 * shimmer + .5 * flash)));
+      R = lerp(255, 255, shimmer); G = lerp(196, 232, shimmer); B = lerp(222, 205, shimmer);
+      R = lerp(R, 255, flash); G = lerp(G, 255, flash); B = lerp(B, 255, flash);
+      const dim = .72 + .28 * lv; R *= dim; G *= dim; B *= dim;
+    } else {
+      ci = glIdx(h);
+      const ac = ART[Math.floor(p.rn * ART.length)];
+      R = lerp(ac[0], 255, e); G = lerp(ac[1], 200, e); B = lerp(ac[2], 225, e);
+    }
+    put(Math.round(cc), Math.round(rr), 20, ci, R, G, B);
+  }
+
+  /* gold sparks rising around the rose */
+  const sparkAmt = sm((t - 10.5) / 3) * (1 - sm((t - 21.5) / 2)) * fadeAll;
+  if (sparkAmt > .01) {
+    for (let k = 0; k < 90; k++) {
+      const r1 = ((k * 0.61803) % 1), r2 = ((k * 0.37 + .11) % 1), r3 = ((k * 0.7548) % 1);
+      const life = ((t * (.06 + r2 * .08) + r1) % 1);
+      if (r3 > sparkAmt) continue;
+      const ax = cx0 + Math.sin(life * 9 + k) * S * (.5 + r2) * 1.15;
+      const ay = cy0 + S * .6 - life * S * 2.3;
+      const f = Math.sin(life * Math.PI);
+      const ch = f > .6 ? ".+*"[k % 3] : ".";
+      put(Math.floor(ax / cw), Math.floor(ay / chh), 15, ch === "." ? 1 : ch === "+" ? 5 : 7, 255 * f + 40, 190 * f + 20, 90 * f);
+    }
+  }
+
+  /* ambient artifacts: dim glitch noise + horizontal tearing bars */
+  const amb = (.3 + .7 * (1 - sm((t - 6) / 4))) * fadeAll * (1 - .6 * sm((t - DISS0) / 2) ) + .5 * sm((t - DISS0) / 2) * fadeAll;
+  if (t - ambAt > .11 || t < ambAt) {
+    ambAt = t; ambCells = [];
+    const n = Math.floor(cols * rows * .006 * amb);
+    for (let k = 0; k < n; k++) ambCells.push([Math.floor(Math.random() * cols), Math.floor(Math.random() * rows), Math.random(), Math.random()]);
+    const bars = Math.random() < .55 * amb ? 1 + (Math.random() * 2 | 0) : 0;
+    for (let b = 0; b < bars; b++) {
+      const r = Math.floor(Math.random() * rows), c0 = Math.floor(Math.random() * cols), L = 6 + Math.floor(Math.random() * 34);
+      const col = Math.random();
+      for (let k = 0; k < L; k++) ambCells.push([c0 + k, r, Math.random(), col, 1]);
+    }
+  }
+  for (const a of ambCells) {
+    const ac = ART[Math.floor(a[3] * ART.length)], d = a[4] ? .55 : .38;
+    put(a[0], a[1], -50, glIdx(a[2]), ac[0] * d, ac[1] * d, ac[2] * d);
+  }
+}
+
+/* ---- draw cells to canvas ---- */
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "rgba(5,3,8,0.5)";
+  ctx.fillRect(0, 0, cvs.width, cvs.height);
+  ctx.font = `${(fs * dpr).toFixed(1)}px ${FONT}`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const cwp = cw * dpr, chp = chh * dpr;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const k = r * cols + c, ci = cCh[k];
+    if (!ci) continue;
+    ctx.fillStyle = `rgb(${cR[k]|0},${cG[k]|0},${cB[k]|0})`;
+    ctx.fillText(ci < 10 ? RAMP[ci] : GL[ci - 10], (c + .5) * cwp, (r + .52) * chp);
+  }
+  gctx.imageSmoothingEnabled = true; gctx.imageSmoothingQuality = "high";
+  gctx.clearRect(0, 0, glow.width, glow.height);
+  gctx.drawImage(cvs, 0, 0, glow.width, glow.height);
+}
+
+/* ---- loop / controls ---- */
+const q = new URLSearchParams(location.search + location.hash.replace("#", "&"));
+const fixed = q.has("t") ? parseFloat(q.get("t")) : null;
+let t0 = performance.now(), paused = false, tPause = 0;
+function tick(now) {
+  let t = fixed !== null ? fixed : paused ? tPause : ((now - t0) / 1000) % T_LOOP;
+  if (!paused) tPause = t;
+  render(t); draw();
+  if (fixed === null) requestAnimationFrame(tick);
+}
+addEventListener("resize", () => { layout(); });
+addEventListener("click", () => { t0 = performance.now(); paused = false; });
+addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); if (paused) { t0 = performance.now() - tPause * 1000; paused = false; } else paused = true; }
+});
+layout();
+if (fixed !== null) { for (let i = 0; i < 3; i++) { render(fixed); draw(); } } else requestAnimationFrame(tick);
+window.__ready = true;
+})();
+</script>
+</body>
+</html>
